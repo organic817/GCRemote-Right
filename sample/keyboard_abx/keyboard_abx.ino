@@ -144,7 +144,6 @@ void setSlowAdvertising() {
 }
 
 void setup() {
-  Serial.begin(115200);
 
   for (int i = 0; i < numPins; i++) {
     pinMode(pins[i], INPUT_PULLUP);    // ピンのプルアップ設定、ボタンはGND接地でON
@@ -162,7 +161,6 @@ void setup() {
   pSec->setKeySize(16);
   pSec->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
 
-  Serial.println("Ready with remapped pins (B=2, X=3, A=4).");
 }
 
 
