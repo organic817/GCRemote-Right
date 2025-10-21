@@ -1,6 +1,9 @@
 #include <BleKeyboard.h>
 #include <BLESecurity.h>
 #include <BLEDevice.h>
+#include "esp_bt.h"
+#include "esp_gap_ble_api.h"
+#include "esp_pm.h"
 
 // ===== BLE Keyboard Name & UUID =====
 BleKeyboard bleKeyboard("GC-Right", "GC", 100);
@@ -17,17 +20,17 @@ const char SHORTPRESS_A_KEY = 'a';       // Aボタン短押し時に送信（a�
 const char SHORTPRESS_B_KEY = 'b';       // Bボタン短押し時に送信（bキー）
 const char SHORTPRESS_X_KEY = 'x';       // Xボタン短押し時に送信（xキー）
 
-// 長押し時の送信キーコード（外部変数で変更可能）
+// 長押し時の送信キーコード
 char LONGPRESS_A_KEY = '\n';  // Aボタン長押しで送るキー（Enter）
 char LONGPRESS_B_KEY = '\b';  // Bボタン長押しで送るキー（Backspace）
 char LONGPRESS_X_KEY = 'X';   // Xボタン長押しで送るキー（x）
 
-// 長押し有効/無効の設定（個別変数）
+// 長押し有効/無効の設定
 bool longPressEnabled_A = true;   // Aボタンの長押し有効/無効
 bool longPressEnabled_B = true;   // Bボタンの長押し有効/無効
 bool longPressEnabled_X = false;  // Xボタンの長押し有効/無効
 
-// ボタン連打有効/無効の設定（個別変数）
+// ボタン連打有効/無効の設定
 bool repeatEnabled_A = false;    // Aボタンの連打有効/無効
 bool repeatEnabled_B = true;     // Bボタンの連打有効/無効
 bool repeatEnabled_X = false;    // Xボタンの連打有効/無効
@@ -83,6 +86,26 @@ const unsigned long repeatRateMs      = 60;   // 長押し中の連打周期（�
 ※ 短くしすぎると誤検出が増えるため、実機で確認しながら調整してください。
 */
 
+// ===== 省電力設定 =====
+  // BLE送信出力を下げて省電力化（デフォルトは最大出力）
+  // ESP_PWR_LVL_N12 = -12dBm（最小出力）
+  // ESP_PWR_LVL_N9  = -9dBm
+  // ESP_PWR_LVL_N6  = -6dBm
+  // ESP_PWR_LVL_N3  = -3dBm
+  // ESP_PWR_LVL_P0  = 0dBm（デフォルト）
+  // ESP_PWR_LVL_P3  = +3dBm
+  // ESP_PWR_LVL_P6  = +6dBm（最大出力）
+esp_power_level_t bleTxPower = ESP_PWR_LVL_N6;  // BLE送信出力（-6dBm）
+const int cpuFreqMhz = 80;                      // CPU周波数（MHz）
+const int pmMaxFreqMhz = 160;                   // 最大CPU周波数
+const int pmMinFreqMhz = 10;                    // 最小CPU周波数
+
+// ===== BLE接続パラメータ =====
+const int connMinInt = 0x30;                  // 最小接続間隔（48ms）
+const int connMaxInt = 0x50;                  // 最大接続間隔（80ms）
+const int connLatency = 20;                   // スキップ可能な接続イベント数
+const int connTimeout = 600;                 // スーパーバイズタイムアウト（6秒）
+
 
 // ===== 状態管理 =====
 int  activeIndex = -1;
@@ -100,6 +123,14 @@ bool wasConnected = false;
 unsigned long advModeSince = 0;
 enum AdvMode { ADV_FAST, ADV_SLOW };
 AdvMode advMode = ADV_FAST;
+
+// パワーマネジメント用の変数
+esp_pm_lock_handle_t pm_lock = NULL;
+bool pm_lock_acquired = false;
+
+// ペアリング状態管理
+bool isPaired = false;
+unsigned long lastPairingCheck = 0;
 
 // 短押しのキー割り当て（B=GPIO2, X=GPIO3, A=GPIO4）
 char keyOfPin(int pin) {
@@ -134,8 +165,8 @@ void setSlowAdvertising() {
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->setScanResponse(true);
   adv->addServiceUUID(BLEUUID((uint16_t)0x1812));
-  adv->setMinInterval(0x80);  // ≈80ms
-  adv->setMaxInterval(0xA0);  // ≈100ms
+  adv->setMinInterval(0x200);  // ≈320ms
+  adv->setMaxInterval(0x400);  // ≈640ms
   adv->setMinPreferred(0x06);
   adv->setMaxPreferred(0x0C);
   BLEDevice::startAdvertising();
@@ -149,9 +180,45 @@ void setup() {
     pinMode(pins[i], INPUT_PULLUP);    // ピンのプルアップ設定、ボタンはGND接地でON
   }
 
+  // CPU周波数設定
+  setCpuFrequencyMhz(cpuFreqMhz);
+
+  // BLE送信出力設定
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, bleTxPower);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, bleTxPower);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, bleTxPower);
+
+  // 自動スリープ設定
+  esp_pm_config_esp32c3_t pm_config = {
+    .max_freq_mhz = pmMaxFreqMhz,
+    .min_freq_mhz = pmMinFreqMhz,
+    .light_sleep_enable = true
+  };
+  
+  esp_err_t pm_err = esp_pm_configure(&pm_config);
+  if (pm_err == ESP_OK) {
+    // アイドル時に自動的にライトスリープに入るように設定
+    esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "ble_active", &pm_lock);
+    // BLEアクティブ時のみCPU周波数を最大に維持
+  }
+  
+  // ペアリング状態をチェック（初回は未ペアリングとして開始）
+  isPaired = false;
+
   bleKeyboard.begin(); // BLE初期化
 
-  // 起動直後は“高速アドバタイズ”で即アピール
+  // 2M PHYを優先
+  esp_ble_gap_set_prefered_default_phy(ESP_BLE_GAP_PHY_2M, ESP_BLE_GAP_PHY_2M);
+
+  // BLE接続パラメータ設定
+  esp_ble_conn_update_params_t conn_params = {0};
+  conn_params.min_int = connMinInt;
+  conn_params.max_int = connMaxInt;
+  conn_params.latency = connLatency;
+  conn_params.timeout = connTimeout;
+  esp_ble_gap_update_conn_params(&conn_params);
+
+  // 起動直後は"高速アドバタイズ"で即アピール
   setFastAdvertising();
 
   // ペアリングチューニング
@@ -167,23 +234,63 @@ void setup() {
 void loop() {
   // 接続状態の変化で広告モードを調整
   bool connected = bleKeyboard.isConnected();
+  
+  // ペアリング状態を定期的にチェック（5秒間隔）
+  unsigned long now = millis();
+  if (now - lastPairingCheck > 5000) {
+    // 接続されていればペアリング済みとみなす
+    isPaired = connected;
+    lastPairingCheck = now;
+  }
+  
   if (connected && !wasConnected) {
     // 接続後省電力のスロー広告
     setSlowAdvertising();
+    // 接続時はパワーロックを取得してCPU周波数を維持
+    if (pm_lock && !pm_lock_acquired) {
+      esp_pm_lock_acquire(pm_lock);
+      pm_lock_acquired = true;
+    }
   }
   if (!connected && wasConnected) {
     // 切断の際に高速広告で再アピール
     setFastAdvertising();
+    // 切断時はパワーロックを解放して省電力モードに
+    if (pm_lock && pm_lock_acquired) {
+      esp_pm_lock_release(pm_lock);
+      pm_lock_acquired = false;
+    }
   }
-  // 未接続が長い時にスローへ戻す省電力運用
-  if (!connected && advMode == ADV_FAST && millis() - advModeSince > 30000UL) {
-    setSlowAdvertising();
+  
+  // 未ペアリング時は常に高速広告を維持（スリープしない）
+  if (!isPaired) {
+    if (advMode != ADV_FAST) {
+      setFastAdvertising();
+    }
+    // 未ペアリング時はパワーロックを取得してスリープを防止
+    if (pm_lock && !pm_lock_acquired) {
+      esp_pm_lock_acquire(pm_lock);
+      pm_lock_acquired = true;
+    }
+  } else {
+    // ペアリング済みで未接続の場合は省電力モード
+    if (!connected && advMode == ADV_FAST && millis() - advModeSince > 30000UL) {
+      setSlowAdvertising();
+    }
+    // ペアリング済みで未接続時はパワーロックを解放してスリープを許可
+    if (!connected && pm_lock && pm_lock_acquired) {
+      esp_pm_lock_release(pm_lock);
+      pm_lock_acquired = false;
+    }
   }
+  
   wasConnected = connected;
 
-  if (!connected) { delay(1); return; }
-
-  const unsigned long now = millis();
+  if (!connected) { 
+    // 未接続時は短いディレイで省電力
+    delay(10); 
+    return; 
+  }
 
   // デバウンス処理
   for (int i = 0; i < numPins; i++) {
