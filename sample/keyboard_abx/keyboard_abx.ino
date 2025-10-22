@@ -95,14 +95,14 @@ const unsigned long repeatRateMs      = 60;   // 長押し中の連打周期（�
   // ESP_PWR_LVL_P0  = 0dBm（デフォルト）
   // ESP_PWR_LVL_P3  = +3dBm
   // ESP_PWR_LVL_P6  = +6dBm（最大出力）
-esp_power_level_t bleTxPower = ESP_PWR_LVL_N6;  // BLE送信出力（-6dBm）
+esp_power_level_t bleTxPower = ESP_PWR_LVL_N0;  // BLE送信出力
 const int cpuFreqMhz = 80;                      // CPU周波数（MHz）
-const int pmMaxFreqMhz = 160;                   // 最大CPU周波数
+const int pmMaxFreqMhz = 80;                   // 最大CPU周波数
 const int pmMinFreqMhz = 10;                    // 最小CPU周波数
 
 // ===== BLE接続パラメータ =====
-const int connMinInt = 0x30;                  // 最小接続間隔（48ms）
-const int connMaxInt = 0x50;                  // 最大接続間隔（80ms）
+const int connMinInt = 0x60;                  // 最小接続間隔
+const int connMaxInt = 0x80;                  // 最大接続間隔
 const int connLatency = 20;                   // スキップ可能な接続イベント数
 const int connTimeout = 600;                 // スーパーバイズタイムアウト（6秒）
 
@@ -195,12 +195,12 @@ void setup() {
     .light_sleep_enable = true
   };
   
-  esp_err_t pm_err = esp_pm_configure(&pm_config);
-  if (pm_err == ESP_OK) {
-    // アイドル時に自動的にライトスリープに入るように設定
-    esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "ble_active", &pm_lock);
-    // BLEアクティブ時のみCPU周波数を最大に維持
-  }
+  // esp_err_t pm_err = esp_pm_configure(&pm_config);
+  // if (pm_err == ESP_OK) {
+  //   // アイドル時に自動的にライトスリープに入るように設定
+  //   esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "ble_active", &pm_lock);
+  //   // BLEアクティブ時のみCPU周波数を最大に維持
+  // }
   
   // ペアリング状態をチェック（初回は未ペアリングとして開始）
   isPaired = false;
@@ -244,12 +244,12 @@ void loop() {
   }
   
   if (connected && !wasConnected) {
-    // 接続後省電力のスロー広告
-    setSlowAdvertising();
+    // 接続時は広告を停止して省電力
+    BLEDevice::stopAdvertising();
     // 接続時はパワーロックを取得してCPU周波数を維持
     if (pm_lock && !pm_lock_acquired) {
-      esp_pm_lock_acquire(pm_lock);
-      pm_lock_acquired = true;
+      // esp_pm_lock_acquire(pm_lock);
+      // pm_lock_acquired = true;
     }
   }
   if (!connected && wasConnected) {
@@ -257,8 +257,8 @@ void loop() {
     setFastAdvertising();
     // 切断時はパワーロックを解放して省電力モードに
     if (pm_lock && pm_lock_acquired) {
-      esp_pm_lock_release(pm_lock);
-      pm_lock_acquired = false;
+      // esp_pm_lock_release(pm_lock);
+      // pm_lock_acquired = false;
     }
   }
   
@@ -269,8 +269,8 @@ void loop() {
     }
     // 未ペアリング時はパワーロックを取得してスリープを防止
     if (pm_lock && !pm_lock_acquired) {
-      esp_pm_lock_acquire(pm_lock);
-      pm_lock_acquired = true;
+      // esp_pm_lock_acquire(pm_lock);
+      // pm_lock_acquired = true;
     }
   } else {
     // ペアリング済みで未接続の場合は省電力モード
@@ -279,8 +279,8 @@ void loop() {
     }
     // ペアリング済みで未接続時はパワーロックを解放してスリープを許可
     if (!connected && pm_lock && pm_lock_acquired) {
-      esp_pm_lock_release(pm_lock);
-      pm_lock_acquired = false;
+      // esp_pm_lock_release(pm_lock);
+      // pm_lock_acquired = false;
     }
   }
   
@@ -380,5 +380,6 @@ void loop() {
     }
   }
 
-  delay(1);
+  // 接続時も長いディレイで省電力
+  delay(10);
 }
